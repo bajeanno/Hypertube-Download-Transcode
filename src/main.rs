@@ -1,27 +1,22 @@
-use anyhow::anyhow;
-use axum::extract::{Path, State};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use librqbit::{AddTorrent, AddTorrentResponse, Session};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, post};
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-mod downloads;
-use downloads::TorrentList;
+mod transcode;
+
+const MEDIA_PATH: &str = "/Users/mini/hypertube/media";
 
 struct AppError(anyhow::Error);
 
-struct AppState {
-    session: Arc<Session>,
-    torrents_list: Arc<TorrentList>,
-}
-
-struct Index {
-    index: usize,
-}
+#[allow(dead_code)]
+struct AppState;
 
 impl From<anyhow::Error> for AppError {
     fn from(value: anyhow::Error) -> Self {
@@ -37,61 +32,71 @@ impl IntoResponse for AppError {
 
 #[derive(Deserialize)]
 struct DownloadRequest {
-    filename: String,
+    preferred_language: String,
+    torrent_id: usize,
 }
 
+#[allow(dead_code)]
 struct DownloadId {
     id: usize,
 }
 
-#[allow(unreachable_code)]
-async fn download(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<DownloadRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    let resp = state
-        .session
-        .add_torrent(AddTorrent::from_local_filename(&req.filename)?, None)
-        .await?;
-    match resp {
-        AddTorrentResponse::Added(id, handle) | AddTorrentResponse::AlreadyManaged(id, handle) => {
-            state
-                .torrents_list
-                .insert(id, handle.output_folder().into());
-            tokio::spawn(async move { handle.wait_until_completed().await });
-            Ok(format!("started torrent #{id}"))
-        }
-        _ => Err(anyhow!("torrent added but not initialized").into()),
-    }
-}
-
-async fn stop() {
-    println!("stop todo");
-}
-
 #[allow(unused)]
-async fn index(
+async fn transcode_delete(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-) -> Result<axum::response::Json<Index>, AppError> {
-    todo!()
+    Path(id): Path<usize>,
+) -> Result<impl IntoResponse, AppError> {
+    Ok(format!("parsed: {id}"))
+}
+
+fn clean_output_dir(output_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let patterns = ["m3u8", "ts", "vtt", "json", "tmp", "part"];
+
+    for entry in std::fs::read_dir(output_dir)? {
+        let path = entry?.path();
+
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| patterns.contains(&ext))
+        {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn transcode(
+    State(_state): State<Arc<AppState>>,
+    Query(req): Query<DownloadRequest>,
+    body: Body,
+) -> Result<impl IntoResponse, AppError> {
+    let preferred_lang = req.preferred_language.clone();
+    let output_dir =
+        PathBuf::from(MEDIA_PATH).join(std::path::Path::new(&req.torrent_id.to_string()));
+    let _ = clean_output_dir(&output_dir);
+
+    transcode::convert_pipe_hls(body.into_data_stream(), output_dir, preferred_lang)
+        .await
+        .map_err(|err| AppError(anyhow::anyhow!("{err}")))?;
+
+    Ok(())
+}
+
+async fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, "404 not found").into_response()
 }
 
 #[tokio::main]
 async fn main() {
-    let session = Session::new("/Users/bolide/Downloads/torrents".into())
-        .await
-        .expect("cannot start rqbit session");
-    let downloads = TorrentList::new();
+    let state = Arc::new(AppState);
 
-    let state = Arc::new(AppState {
-        session,
-        torrents_list: downloads,
-    });
     let app: Router = Router::new()
-        .route("/download", post(download))
-        .route("/stop", post(stop))
-        .route("/index/{id}", get(index))
+        .route("/transcode", post(transcode))
+        .route("/transcode/{id}", delete(transcode_delete))
+        .fallback(not_found)
         .with_state(state);
 
     let addr: &str = "0.0.0.0:3000";
